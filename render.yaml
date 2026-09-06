@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: sardar-vip-bot
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python sardar_bot_fixed.py
+    envVars:
+      - key: DATA_DIR
+        value: /var/data
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: CHANNEL_ID
+        sync: false
+      - key: BONUS_PERCENT
+        sync: false
+      - key: BANK_CARD
+        sync: false
+      - key: BANK_OWNER
+        sync: false
+    disk:
+      name: sardar-data
+      mountPath: /var/data
+      sizeGB: 1
