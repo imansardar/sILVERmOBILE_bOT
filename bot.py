@@ -1,26 +1,15 @@
 # ============================================================
 # 📦 ایمپورت‌ها
 # ============================================================
+from builtins import int
 import os
 import re
 import time
 import json
 import logging
-import psycopg2
-import psycopg2.extras
-import os
+import sqlite3
 from datetime import datetime
-
-# ایمپورت دات‌env با fallback
-try:
-    from dotenv import load_dotenv
-except ModuleNotFoundError:
-    import subprocess
-    import sys
-    print("📦 نصب python-dotenv به‌صورت خودکار...")
-    from dotenv import load_dotenv
-
-load_dotenv()   # ✅ حتماً این خط رو اضافه کن
+from dotenv import load_dotenv
 
 import telebot
 from telebot import types
@@ -35,11 +24,12 @@ CHANNEL_ID = os.getenv("CHANNEL_ID", "@StoreSardaarApple")
 BONUS_PERCENT = int(os.getenv("BONUS_PERCENT", 5))
 BANK_CARD = os.getenv("BANK_CARD", "5022291331447233")
 BANK_OWNER = os.getenv("BANK_OWNER", "ایمان سردار راد")
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8904951204:AAFS8Ae27-xuBSfarkDLyTm1nMbNB2v6dQo").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN در Environment Variables تنظیم نشده است.")
 
 bot = telebot.TeleBot(BOT_TOKEN)
+bot.delete_webhook()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -47,9 +37,30 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # 💾 دیتابیس SQLite (با ساختار اصلاح‌شده)
 # ============================================================
-DB_PATH = "sardar_app_store.db"
+# ============================================================
+# 💾 مسیر دیتابیس
+# روی Render باید DATA_DIR روی Mount Path دیسک دائمی تنظیم شود.
+# محلی: ./data
+# Render: /var/data
+# ============================================================
+DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.getcwd(), "data"))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "sardar_app_store.db")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+def get_db():
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False,
+    )
+    conn.execute("PRAGMA busy_timeout = 30000")
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        conn.execute("PRAGMA journal_mode = WAL")
+    except sqlite3.DatabaseError:
+        pass
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS apple_ids (
@@ -216,21 +227,36 @@ def update_setting(key, value):
 # ============================================================
 def get_next_order_id():
     conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("SELECT setting_value FROM bot_settings WHERE setting_key = 'last_order_id'")
-    result = cursor.fetchone()
-    if result:
-        current_id = int(result[0])
-        new_id = current_id + 1
-        cursor.execute("UPDATE bot_settings SET setting_value = ? WHERE setting_key = 'last_order_id'", (str(new_id),))
+    try:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "SELECT setting_value FROM bot_settings WHERE setting_key = 'last_order_id'"
+        )
+        result = cursor.fetchone()
+
+        if result:
+            current_id = int(result[0])
+            new_id = current_id + 1
+            cursor.execute(
+                "UPDATE bot_settings SET setting_value = ? WHERE setting_key = 'last_order_id'",
+                (str(new_id),)
+            )
+        else:
+            new_id = 1001
+            cursor.execute(
+                "INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?)",
+                ("last_order_id", str(new_id))
+            )
+
         conn.commit()
-        conn.close()
         return new_id
-    else:
-        cursor.execute("INSERT INTO bot_settings (setting_key, setting_value) VALUES (?, ?)", ("last_order_id", "1001"))
-        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("خطا در ساخت شماره سفارش جدید")
+        raise
+    finally:
         conn.close()
-        return 1001
 
 def payment_markup(order_id):
     """روش‌های پرداخت بانکی؛ برای شارژ کیف پول استفاده می‌شود."""
@@ -454,11 +480,29 @@ def get_user_balance(user_id):
 def add_new_user(user_id, first_name="", last_name="", phone="", email="", birth_date=""):
     conn = get_db()
     cursor = conn.cursor()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+
     cursor.execute(
-        """INSERT OR IGNORE INTO users 
-        (user_id, balance, join_date, first_name, last_name, phone, email, birth_date) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, 0, time.strftime("%Y-%m-%d %H:%M:%S"), first_name, last_name, phone, email, birth_date)
+        """INSERT INTO users
+        (user_id, balance, join_date, first_name, last_name, phone, email, birth_date)
+        VALUES (?, 0, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            phone = CASE
+                WHEN excluded.phone <> '' THEN excluded.phone
+                ELSE users.phone
+            END,
+            email = CASE
+                WHEN excluded.email <> '' THEN excluded.email
+                ELSE users.email
+            END,
+            birth_date = CASE
+                WHEN excluded.birth_date <> '' THEN excluded.birth_date
+                ELSE users.birth_date
+            END
+        """,
+        (user_id, now, first_name or "", last_name or "", phone or "", email or "", birth_date or "")
     )
     conn.commit()
     conn.close()
@@ -500,14 +544,35 @@ def get_all_users():
 # ============================================================
 # 📦 توابع ذخیره‌سازی خریدها
 # ============================================================
-def create_purchase_record(user_id, order_id, product_type, product_detail, password):
+def create_purchase_record(user_id, order_id, product_type, product_detail, password, status="pending"):
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        """INSERT OR IGNORE INTO user_purchases 
-        (user_id, order_id, product_type, product_detail, password, purchase_date, status) 
-        VALUES (?, ?, ?, ?, ?, ?, ?)""",
-        (user_id, order_id, product_type, product_detail, password, time.strftime("%Y-%m-%d %H:%M:%S"), "pending")
+        """INSERT INTO user_purchases
+        (user_id, order_id, product_type, product_detail, password, purchase_date, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(order_id) DO UPDATE SET
+            user_id = excluded.user_id,
+            product_type = excluded.product_type,
+            product_detail = CASE
+                WHEN excluded.product_detail <> '' THEN excluded.product_detail
+                ELSE user_purchases.product_detail
+            END,
+            password = CASE
+                WHEN excluded.password <> '' THEN excluded.password
+                ELSE user_purchases.password
+            END,
+            status = excluded.status
+        """,
+        (
+            user_id,
+            order_id,
+            product_type,
+            product_detail or "",
+            password or "",
+            time.strftime("%Y-%m-%d %H:%M:%S"),
+            status
+        )
     )
     conn.commit()
     conn.close()
@@ -536,7 +601,7 @@ def save_failed_purchase(user_id, product_type, price, reason="لغو توسط �
 def get_user_purchase_stats(user_id):
     conn = get_db()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM user_purchases WHERE user_id = ? AND status = 'completed'", (user_id,))
+    cursor.execute("SELECT COUNT(*) FROM user_purchases WHERE user_id = ? AND status IN ('confirmed', 'delivered')", (user_id,))
     success_count = cursor.fetchone()[0]
     cursor.execute("SELECT COUNT(*) FROM failed_purchases WHERE user_id = ?", (user_id,))
     failed_count = cursor.fetchone()[0]
@@ -567,7 +632,6 @@ def check_inventory_and_notify():
             bot.send_message(ADMIN_ID, f"⚠️ هشدار: تعداد ایمیل‌های موجود کمتر از ۵ است (تعداد: {email_count})")
     except Exception as e:
         logger.error(f"خطا در ارسال نوتیفیکیشن به ادمین: {e}")
-
 
 # ============================================================
 # 💾 توابع مدیریت اپل‌آیدی و ایمیل
@@ -697,7 +761,7 @@ def is_member(user_id):
         member = bot.get_chat_member(CHANNEL_ID, user_id)
         return member.status in ["member", "administrator", "creator"]
     except:
-        return True
+        return False
 
 def join_channel_button():
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -752,26 +816,18 @@ def check_membership(call):
 def start(message):
     user_id = message.chat.id
     add_new_user(user_id, first_name=message.from_user.first_name, last_name=message.from_user.last_name or "")
-    try:
-        if is_member(user_id):
-            balance = get_user_balance(user_id)
-            bot.send_message(
-                user_id,
-                f"👋 سلام {message.from_user.first_name} عزیز!\nبه ربات فروشگاه SARDAR VIP خوش آمدید.\n💰 موجودی شما: {balance:,} تومان",
-                reply_markup=main_menu(user_id)
-            )
-        else:
-            bot.send_message(
-                user_id,
-                "🔒 لطفاً ابتدا در کانال عضو شوید تا بتوانید از خدمات استفاده کنید.",
-                reply_markup=join_channel_button()
-            )
-    except Exception as e:
+    if is_member(user_id):
         balance = get_user_balance(user_id)
         bot.send_message(
             user_id,
             f"👋 سلام {message.from_user.first_name} عزیز!\nبه ربات فروشگاه SARDAR VIP خوش آمدید.\n💰 موجودی شما: {balance:,} تومان",
             reply_markup=main_menu(user_id)
+        )
+    else:
+        bot.send_message(
+            user_id,
+            "🔒 لطفاً ابتدا در کانال عضو شوید تا بتوانید از خدمات استفاده کنید.",
+            reply_markup=join_channel_button()
         )
 
 # ============================================================
@@ -1317,6 +1373,7 @@ def _remove_admin_buttons(call):
         )
     except Exception as e:
         logger.warning(f"خطا در حذف دکمه‌های ادمین: {e}")
+
 
 def _confirm_balance_order(call, order_id, temp):
     """تأیید شارژ کیف پول؛ این تابع هیچ‌وقت دکمه ارسال محصول نمی‌سازد."""
@@ -2526,16 +2583,64 @@ def back_button(message):
     back_to_main(message)
 
 # ============================================================
+# 🩺 تست دیتابیس توسط ادمین
+# ============================================================
+@bot.message_handler(commands=["dbcheck"])
+def dbcheck(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM users")
+        users_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM temp_orders")
+        orders_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM apple_ids")
+        apples_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM emails")
+        emails_count = cur.fetchone()[0]
+        conn.close()
+
+        bot.send_message(
+            ADMIN_ID,
+            "🩺 تست دیتابیس\n\n"
+            f"📁 مسیر: `{os.path.abspath(DB_PATH)}`\n"
+            f"👥 کاربران: {users_count}\n"
+            f"🧾 سفارش‌ها: {orders_count}\n"
+            f"🍏 اپل‌آیدی‌ها: {apples_count}\n"
+            f"📧 ایمیل‌ها: {emails_count}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.exception("DBCHECK failed")
+        bot.send_message(ADMIN_ID, f"❌ خطای دیتابیس: {e}")
+
+# ============================================================
 # 🏃 اجرای ربات
 # ============================================================
 if __name__ == "__main__":
     print("\n========================================")
     print("✅ SARDAR VIP - FIXED ORDER ROUTING v2")
     print("========================================\n")
-    logger.info("🤖 ربات SARDAR  در حال راه‌اندازی...")
-    logger.info("🤖 @SardarApple_Bot")
+    logger.info("🤖 ربات SARDAR در حال راه‌اندازی...")
+    logger.info("📁 مسیر دیتابیس: %s", os.path.abspath(DB_PATH))
+    try:
+        init_conn = get_db()
+        init_conn.close()
+        logger.info("✅ دیتابیس با موفقیت آماده شد.")
+    except Exception:
+        logger.exception("❌ خطا در آماده‌سازی دیتابیس")
+        raise
+
+    logger.info("🤖 @SilverMobilStore_Bot")
     check_inventory_and_notify()
-    # bot.delete_webhook()  # کامنت شد تا خطا نده
+    try:
+        bot.delete_webhook()
+        logger.info("✅ وب‌هوک حذف شد.")
+    except Exception as e:
+        logger.warning(f"⚠️ خطا در حذف وب‌هوک: {e}")
     logger.info("✅ شروع به دریافت پیام‌ها...")
     try:
         bot.polling(non_stop=True, interval=0, timeout=20)
